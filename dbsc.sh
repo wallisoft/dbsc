@@ -16,6 +16,11 @@
 #   --replace-block <path> <s> <old_file> <new_file>  Like replace-range, but
 #                                  "end" is derived from old_file's line count,
 #                                  and the DB is verified against it first
+#   --find-brace <path> <s>        Preview the block from <s> to its matching
+#                                  closing brace, without changing anything
+#   --replace-brace <path> <s> <new_file>  Replace <s> through its matching
+#                                  closing brace in one shot (naive counting —
+#                                  no awareness of strings/comments)
 #   --line <path> <n>             Print a single line's content
 #   --show <path>                  Show current version (lines)
 #   --list <path>                  List versions
@@ -54,6 +59,8 @@ while [[ $# -gt 0 ]]; do
         --replace-line) ACTION="replace_line"; PATH_ARG="$2"; LINE_NUM="$3"; CONTENT_ARG="$4"; shift 4 ;;
         --replace-range) ACTION="replace_range"; PATH_ARG="$2"; START_ARG="$3"; END_ARG="$4"; RANGE_FILE_ARG="$5"; shift 5 ;;
         --replace-block) ACTION="replace_block"; PATH_ARG="$2"; START_ARG="$3"; OLD_FILE_ARG="$4"; RANGE_FILE_ARG="$5"; shift 5 ;;
+        --find-brace) ACTION="find_brace"; PATH_ARG="$2"; LINE_NUM="$3"; shift 3 ;;
+        --replace-brace) ACTION="replace_brace"; PATH_ARG="$2"; LINE_NUM="$3"; RANGE_FILE_ARG="$4"; shift 4 ;;
         --line) ACTION="line"; PATH_ARG="$2"; LINE_NUM="$3"; shift 3 ;;
         --show) ACTION="show"; PATH_ARG="$2"; shift 2 ;;
         --list) ACTION="list"; PATH_ARG="$2"; shift 2 ;;
@@ -84,6 +91,8 @@ Usage:
   dbsc.sh --replace-block <path> <start> <old_file> <new_file>  # Same, but end is automatic —
                                                   # derived from old_file's line count, and
                                                   # verified against the DB before replacing
+  dbsc.sh --find-brace <path> <start>            # Preview block from <start> to its matching }
+  dbsc.sh --replace-brace <path> <start> <file>  # Replace <start> through its matching } in one shot
   dbsc.sh --line <path> <num>                    # Print a single line's content
   dbsc.sh --show <path>                          # Show current version (numbered)
   dbsc.sh --list <path>                          # List versions
@@ -109,6 +118,8 @@ Examples:
   dbsc.sh --grep-all TODO
   dbsc.sh --replace-range cms_renderer.php 40 55 new_block.php
   dbsc.sh --replace-block cms_renderer.php 40 old_block.php new_block.php
+  dbsc.sh --find-brace cms_renderer.php 40
+  dbsc.sh --replace-brace cms_renderer.php 40 new_function_body.php
   dbsc.sh --line cms_renderer.php 42
   dbsc.sh --show cms_renderer.php --json
   dbsc.sh --rollback cms_renderer.php 1
@@ -415,6 +426,73 @@ replace_block() {
     replace_range "$path" "$start" "$end" "$new_file"
 }
 
+# Find the line where brace depth returns to zero, scanning from `start`.
+# Naive character counting — does not understand strings or comments, so a
+# literal { or } inside a quoted string or a // comment will throw it off.
+# Prints nothing (empty) if no match is found before end of file.
+find_matching_brace() {
+    local fid="$1" start="$2"
+    sqlite3 -batch -noheader -list "$DB_FILE" "
+        SELECT content FROM dbsc_lines WHERE file_id=$fid AND line_order >= $start ORDER BY line_order;
+    " | awk -v start="$start" '
+        {
+            n = length($0)
+            for (i = 1; i <= n; i++) {
+                c = substr($0, i, 1)
+                if (c == "{") { depth++; opened = 1 }
+                else if (c == "}") { depth-- }
+            }
+            if (opened && depth == 0) {
+                print start + NR - 1
+                exit
+            }
+        }
+    '
+}
+
+# Read-only preview: show the block from `start` to its matching closing
+# brace, without changing anything. Use this to sanity-check before
+# --replace-brace, given the naive-matching caveat above.
+show_brace() {
+    local path="$1" start="$2"
+    local fid=$(ensure_file_id "$path")
+    local end=$(find_matching_brace "$fid" "$start")
+    if [ -z "$end" ]; then
+        echo "ERROR: no matching closing brace found starting from line $start in $path." >&2
+        exit 1
+    fi
+    if [ "$JSON_MODE" -eq 1 ]; then
+        local lines_json=$(sqlite3 -json -batch "$DB_FILE" "
+            SELECT line_order AS line, content FROM dbsc_lines
+            WHERE file_id=$fid AND line_order BETWEEN $start AND $end ORDER BY line_order;
+        ")
+        printf '{"path":"%s","start":%s,"end":%s,"lines":%s}\n' "$(json_escape "$path")" "$start" "$end" "$lines_json"
+    else
+        echo "🔎 $path lines $start-$end (matching brace)"
+        sqlite3 -batch -noheader -separator '  ' "$DB_FILE" "
+            SELECT line_order, content FROM dbsc_lines
+            WHERE file_id=$fid AND line_order BETWEEN $start AND $end
+            ORDER BY line_order;
+        "
+    fi
+}
+
+# Replace the block from `start` to its matching closing brace in one shot.
+replace_brace() {
+    local path="$1" start="$2" new_file="$3"
+    if [ ! -f "$new_file" ]; then echo "ERROR: File not found: $new_file"; exit 1; fi
+    if ! [[ "$start" =~ ^[0-9]+$ ]]; then echo "ERROR: invalid start line $start"; exit 1; fi
+    local fid=$(ensure_file_id "$path")
+    local end=$(find_matching_brace "$fid" "$start")
+    if [ -z "$end" ]; then
+        echo "ERROR: no matching closing brace found starting from line $start in $path." >&2
+        echo "Note: brace matching is naive — it doesn't understand strings or comments containing { or }. Try --find-brace first to check." >&2
+        exit 1
+    fi
+    echo "🔎 Found matching brace: lines $start-$end"
+    replace_range "$path" "$start" "$end" "$new_file"
+}
+
 line_at() {
     local path="$1" n="$2"
     local fid=$(ensure_file_id "$path")
@@ -546,6 +624,8 @@ case $ACTION in
     replace_line) replace_line "$PATH_ARG" "$LINE_NUM" "$CONTENT_ARG" ;;
     replace_range) replace_range "$PATH_ARG" "$START_ARG" "$END_ARG" "$RANGE_FILE_ARG" ;;
     replace_block) replace_block "$PATH_ARG" "$START_ARG" "$OLD_FILE_ARG" "$RANGE_FILE_ARG" ;;
+    find_brace) show_brace "$PATH_ARG" "$LINE_NUM" ;;
+    replace_brace) replace_brace "$PATH_ARG" "$LINE_NUM" "$RANGE_FILE_ARG" ;;
     line) line_at "$PATH_ARG" "$LINE_NUM" ;;
     show) show_file "$PATH_ARG" ;;
     list) list_versions "$PATH_ARG" ;;

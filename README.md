@@ -82,6 +82,11 @@ dbsc.sh --replace-range myscript.php 40 55 new_block.php
 # since you last looked, instead of replacing the wrong lines)
 dbsc.sh --replace-block myscript.php 40 old_block.php new_block.php
 
+# Point at an opening brace, swap the whole block up to its match — no line
+# counting at all. Preview first with --find-brace if you're not sure.
+dbsc.sh --find-brace myscript.php 40
+dbsc.sh --replace-brace myscript.php 40 new_function_body.php
+
 # Structured output for scripting/agents — same data, no text-parsing required
 dbsc.sh --show myscript.php --json
 dbsc.sh --grep-all 'TODO' --json
@@ -111,6 +116,8 @@ all.
 | `--replace-line <path> <n> <content>` | Replace a single line in place |
 | `--replace-range <path> <start> <end> <file>` | Atomically replace a block of lines with new content (any line count) |
 | `--replace-block <path> <start> <old_file> <new_file>` | Same, but `end` is automatic — derived from `old_file`'s line count, and the DB is verified against it before replacing |
+| `--find-brace <path> <start>` | Preview the block from `start` to its matching closing brace, without changing anything |
+| `--replace-brace <path> <start> <file>` | Replace `start` through its matching closing brace in one shot — the "find the function, swap the body" move |
 | `--line <path> <n>` | Print a single line's content |
 | `--show <path>` | Print the current version, numbered |
 | `--list <path>` | List all stored versions |
@@ -141,6 +148,11 @@ Two tables, one SQLite file:
 Line-shift operations (`--insert-line` / `--delete-line`) use a
 negate-then-restore pattern to avoid `UNIQUE` constraint collisions, since
 SQLite doesn't guarantee row processing order within a multi-row `UPDATE`.
+
+`--find-brace` / `--replace-brace` do naive character counting of `{` and
+`}` — they don't parse strings or comments, so a literal brace inside a
+quoted string (`$x = "{";`) or a `//` comment will throw the count off.
+Run `--find-brace` first if you're not confident the block is clean.
 
 ## License
 
