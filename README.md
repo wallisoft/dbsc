@@ -65,6 +65,26 @@ dbsc.sh --deploy myscript.php --deploy-dir /var/www/html
 # See every version, and roll back
 dbsc.sh --list myscript.php
 dbsc.sh --rollback myscript.php 2
+
+# Find a line without piping through grep and getting an off-by-one
+# from a header line — output is path:line:content, ready to paste
+# straight into --replace-line
+dbsc.sh --grep myscript.php 'TODO'
+dbsc.sh --grep-all 'error_log'
+
+# Swap a whole block (e.g. a function body) atomically in one transaction —
+# new content can be a different number of lines, the tail renumbers itself
+dbsc.sh --replace-range myscript.php 40 55 new_block.php
+
+# Same idea, but you don't need to count the end line yourself — give the
+# block you expect to find there, its line count becomes the end line, and
+# it's verified against the DB first (aborts cleanly if the file has moved
+# since you last looked, instead of replacing the wrong lines)
+dbsc.sh --replace-block myscript.php 40 old_block.php new_block.php
+
+# Structured output for scripting/agents — same data, no text-parsing required
+dbsc.sh --show myscript.php --json
+dbsc.sh --grep-all 'TODO' --json
 ```
 
 ## Multi-project usage
@@ -89,8 +109,13 @@ all.
 | `--insert-line <path> <n> <content>` | Insert a line, shifting the rest down |
 | `--delete-line <path> <n>` | Delete a line, shifting the rest up |
 | `--replace-line <path> <n> <content>` | Replace a single line in place |
+| `--replace-range <path> <start> <end> <file>` | Atomically replace a block of lines with new content (any line count) |
+| `--replace-block <path> <start> <old_file> <new_file>` | Same, but `end` is automatic — derived from `old_file`'s line count, and the DB is verified against it before replacing |
+| `--line <path> <n>` | Print a single line's content |
 | `--show <path>` | Print the current version, numbered |
 | `--list <path>` | List all stored versions |
+| `--grep <path> <pattern>` | Search one file (`grep -E`), prints `path:line:content` |
+| `--grep-all <pattern>` | Search every active file in the current project |
 | `--rollback <path> <version>` | Reactivate an old version and deploy it |
 | `--init` | Create the DB/schema (also runs automatically on first use) |
 
@@ -101,6 +126,7 @@ all.
 | `--project <name>` | basename of current directory |
 | `--db <file>` | `~/.dbsc/dbsc.db` |
 | `--deploy-dir <dir>` | current directory |
+| `--json` | off — add to `--show`/`--list`/`--grep`/`--grep-all`/`--line` for structured output |
 
 Environment overrides: `DBSC_DB`, `DBSC_DEPLOY_DIR`, `DBSC_PROJECT`, `DBSC_DIR`.
 

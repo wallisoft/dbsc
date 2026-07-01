@@ -12,8 +12,15 @@
 #   --insert-line <path> <n> <c>  Insert a line (shifts later lines)
 #   --delete-line <path> <n>      Delete a line (shifts later lines)
 #   --replace-line <path> <n> <c> Replace a line
+#   --replace-range <path> <s> <e> <file>  Atomically replace a block of lines
+#   --replace-block <path> <s> <old_file> <new_file>  Like replace-range, but
+#                                  "end" is derived from old_file's line count,
+#                                  and the DB is verified against it first
+#   --line <path> <n>             Print a single line's content
 #   --show <path>                  Show current version (lines)
 #   --list <path>                  List versions
+#   --grep <path> <pattern>       Search one file
+#   --grep-all <pattern>          Search every active file in the project
 #   --rollback <path> <version>   Rollback to a previous version
 #   --help                         Show usage
 #
@@ -21,6 +28,7 @@
 #   --project <name>   Scope files to a project (default: basename of cwd)
 #   --db <file>         SQLite DB file (default: ~/.dbsc/dbsc.db)
 #   --deploy-dir <dir>  Where --deploy writes files (default: cwd)
+#   --json              Output --show/--list/--grep/--grep-all/--line as JSON
 
 set -e
 
@@ -34,6 +42,7 @@ command -v sqlite3 >/dev/null 2>&1 || { echo "ERROR: sqlite3 not found. Install 
 # Parse arguments
 ACTION=""
 SHOW_HELP=0
+JSON_MODE=0
 while [[ $# -gt 0 ]]; do
     case $1 in
         --init) ACTION="init"; shift ;;
@@ -43,12 +52,18 @@ while [[ $# -gt 0 ]]; do
         --insert-line) ACTION="insert_line"; PATH_ARG="$2"; LINE_NUM="$3"; CONTENT_ARG="$4"; shift 4 ;;
         --delete-line) ACTION="delete_line"; PATH_ARG="$2"; LINE_NUM="$3"; shift 3 ;;
         --replace-line) ACTION="replace_line"; PATH_ARG="$2"; LINE_NUM="$3"; CONTENT_ARG="$4"; shift 4 ;;
+        --replace-range) ACTION="replace_range"; PATH_ARG="$2"; START_ARG="$3"; END_ARG="$4"; RANGE_FILE_ARG="$5"; shift 5 ;;
+        --replace-block) ACTION="replace_block"; PATH_ARG="$2"; START_ARG="$3"; OLD_FILE_ARG="$4"; RANGE_FILE_ARG="$5"; shift 5 ;;
+        --line) ACTION="line"; PATH_ARG="$2"; LINE_NUM="$3"; shift 3 ;;
         --show) ACTION="show"; PATH_ARG="$2"; shift 2 ;;
         --list) ACTION="list"; PATH_ARG="$2"; shift 2 ;;
+        --grep) ACTION="grep"; PATH_ARG="$2"; PATTERN_ARG="$3"; shift 3 ;;
+        --grep-all) ACTION="grep_all"; PATTERN_ARG="$2"; shift 2 ;;
         --rollback) ACTION="rollback"; PATH_ARG="$2"; VERSION_ARG="$3"; shift 3 ;;
         --project) PROJECT="$2"; shift 2 ;;
         --db) DB_FILE="$2"; shift 2 ;;
         --deploy-dir) DEPLOY_DIR="$2"; shift 2 ;;
+        --json) JSON_MODE=1; shift ;;
         --help|-h) SHOW_HELP=1; shift ;;
         *) echo "Unknown option: $1"; SHOW_HELP=1; shift ;;
     esac
@@ -65,14 +80,22 @@ Usage:
   dbsc.sh --insert-line <path> <num> <content>   # Insert a line (shift)
   dbsc.sh --delete-line <path> <num>             # Delete a line (shift)
   dbsc.sh --replace-line <path> <num> <content>  # Replace a line
+  dbsc.sh --replace-range <path> <start> <end> <file>  # Atomically replace a block of lines
+  dbsc.sh --replace-block <path> <start> <old_file> <new_file>  # Same, but end is automatic —
+                                                  # derived from old_file's line count, and
+                                                  # verified against the DB before replacing
+  dbsc.sh --line <path> <num>                    # Print a single line's content
   dbsc.sh --show <path>                          # Show current version (numbered)
   dbsc.sh --list <path>                          # List versions
+  dbsc.sh --grep <path> <pattern>                # Search one file (grep -E), prints path:line:content
+  dbsc.sh --grep-all <pattern>                   # Search every active file in the project
   dbsc.sh --rollback <path> <version>            # Rollback to a previous version
 
 Options:
   --project <name>    Scope (default: basename of cwd, i.e. "$PROJECT")
   --db <file>         SQLite file (default: ~/.dbsc/dbsc.db)
   --deploy-dir <dir>  Deploy directory (default: cwd)
+  --json              Output --show/--list/--grep/--grep-all/--line as JSON
   --help              Show this help
 
 Env overrides: DBSC_DB, DBSC_DEPLOY_DIR, DBSC_PROJECT, DBSC_DIR
@@ -82,6 +105,12 @@ Examples:
   dbsc.sh --deploy cms_renderer.php
   dbsc.sh --insert-line cms_renderer.php 181 '        error_log("DEBUG");'
   dbsc.sh --show cms_renderer.php | grep DEBUG
+  dbsc.sh --grep cms_renderer.php DEBUG
+  dbsc.sh --grep-all TODO
+  dbsc.sh --replace-range cms_renderer.php 40 55 new_block.php
+  dbsc.sh --replace-block cms_renderer.php 40 old_block.php new_block.php
+  dbsc.sh --line cms_renderer.php 42
+  dbsc.sh --show cms_renderer.php --json
   dbsc.sh --rollback cms_renderer.php 1
   dbsc.sh --project tinyhost --show checkout.php
 EOF
@@ -93,6 +122,17 @@ fi
 # Escape a value for a single-quoted SQLite string literal (only ' needs doubling)
 sql_escape() {
     printf '%s' "${1//\'/\'\'}"
+}
+
+# Escape a value for a JSON string (bash-only, no external deps)
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\t'/\\t}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\n'/\\n}"
+    printf '%s' "$s"
 }
 
 ensure_db() {
@@ -197,6 +237,21 @@ update_file() {
     local path=$(basename "$file")
     local pe=$(sql_escape "$PROJECT")
     local path_e=$(sql_escape "$path")
+
+    # Skip creating a new version if content is identical to the active one
+    local active_fid=$(get_file_id "$path")
+    if [ -n "$active_fid" ]; then
+        local existing_content new_content
+        existing_content=$(sqlite3 -batch -noheader -list "$DB_FILE" "
+            SELECT content FROM dbsc_lines WHERE file_id=$active_fid ORDER BY line_order;
+        " | md5sum)
+        new_content=$(md5sum < "$file")
+        if [ "$existing_content" = "$new_content" ]; then
+            echo "⏭️  No change to $path (project: $PROJECT) — active version unchanged, skipping."
+            return 0
+        fi
+    fi
+
     local version=$(get_next_version "$path")
     [ -z "$version" ] && version=1
 
@@ -282,27 +337,187 @@ replace_line() {
     echo "✅ Line replaced."
 }
 
+# Atomically replace lines [start, end] with the contents of a file. New content
+# can be a different number of lines than the range being replaced — the tail
+# of the file is shifted by the resulting delta (positive, negative, or zero)
+# using the same negate-then-restore trick as insert_line/delete_line.
+replace_range() {
+    local path="$1" start="$2" end="$3" file="$4"
+    if [ ! -f "$file" ]; then
+        echo "ERROR: File not found: $file"
+        exit 1
+    fi
+    if ! [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]] || [ "$start" -gt "$end" ]; then
+        echo "ERROR: invalid range $start-$end"
+        exit 1
+    fi
+    local fid=$(ensure_file_id "$path")
+    local old_count=$((end - start + 1))
+
+    local new_count=0
+    local inserts=""
+    while IFS= read -r line || [ -n "$line" ]; do
+        new_count=$((new_count + 1))
+        local ln=$((start + new_count - 1))
+        inserts+="INSERT INTO dbsc_lines (file_id, line_order, content) VALUES ($fid, $ln, '$(sql_escape "$line")');
+"
+    done < "$file"
+    local delta=$((new_count - old_count))
+
+    local batch
+    batch=$(mktemp)
+    {
+        echo "BEGIN;"
+        echo "DELETE FROM dbsc_lines WHERE file_id=$fid AND line_order BETWEEN $start AND $end;"
+        echo "UPDATE dbsc_lines SET line_order = -line_order WHERE file_id=$fid AND line_order > $end;"
+        echo "UPDATE dbsc_lines SET line_order = -line_order + ($delta) WHERE file_id=$fid AND line_order < 0;"
+        printf '%s' "$inserts"
+        echo "COMMIT;"
+    } > "$batch"
+
+    sqlite3 "$DB_FILE" < "$batch"
+    rm -f "$batch"
+    echo "✅ Replaced lines $start-$end ($old_count line(s)) with $new_count new line(s) in $path (net shift: $delta)."
+}
+
+# Like replace_range, but "end" is automatic: give the block of content you
+# expect to find starting at `start`, and its line count determines where it
+# ends. The DB is checked against that expected content first — if the file
+# has moved under you since you last looked, this aborts instead of
+# silently replacing the wrong lines.
+replace_block() {
+    local path="$1" start="$2" old_file="$3" new_file="$4"
+    if [ ! -f "$old_file" ]; then echo "ERROR: File not found: $old_file"; exit 1; fi
+    if [ ! -f "$new_file" ]; then echo "ERROR: File not found: $new_file"; exit 1; fi
+    if ! [[ "$start" =~ ^[0-9]+$ ]]; then echo "ERROR: invalid start line $start"; exit 1; fi
+    local fid=$(ensure_file_id "$path")
+
+    local old_count=0
+    while IFS= read -r line || [ -n "$line" ]; do old_count=$((old_count + 1)); done < "$old_file"
+    local end=$((start + old_count - 1))
+
+    local expected actual
+    expected=$(cat "$old_file")
+    actual=$(sqlite3 -batch -noheader -list "$DB_FILE" "
+        SELECT content FROM dbsc_lines
+        WHERE file_id=$fid AND line_order BETWEEN $start AND $end
+        ORDER BY line_order;
+    ")
+    if [ "$actual" != "$expected" ]; then
+        echo "ERROR: content at lines $start-$end doesn't match what you expected — the file may have changed since you last looked. Aborting without making changes." >&2
+        echo "--- expected (from $old_file) ---" >&2
+        printf '%s\n' "$expected" >&2
+        echo "--- actual (DB, lines $start-$end) ---" >&2
+        printf '%s\n' "$actual" >&2
+        exit 1
+    fi
+
+    replace_range "$path" "$start" "$end" "$new_file"
+}
+
+line_at() {
+    local path="$1" n="$2"
+    local fid=$(ensure_file_id "$path")
+    local content=$(sqlite3 -batch -noheader -list "$DB_FILE" "
+        SELECT content FROM dbsc_lines WHERE file_id=$fid AND line_order=$n;
+    ")
+    if [ "$JSON_MODE" -eq 1 ]; then
+        printf '{"path":"%s","line":%s,"content":"%s"}\n' "$(json_escape "$path")" "$n" "$(json_escape "$content")"
+    else
+        printf '%s\n' "$content"
+    fi
+}
+
 show_file() {
     local path="$1"
     local fid=$(ensure_file_id "$path")
     local ver=$(sqlite3 -batch "$DB_FILE" "SELECT version FROM dbsc_sources WHERE id=$fid;")
-    echo "📄 $path (project: $PROJECT, version $ver)"
-    sqlite3 -batch -noheader -separator '  ' "$DB_FILE" "
-        SELECT line_order, content FROM dbsc_lines
-        WHERE file_id = $fid
-        ORDER BY line_order;
-    "
+    if [ "$JSON_MODE" -eq 1 ]; then
+        local lines_json=$(sqlite3 -json -batch "$DB_FILE" "
+            SELECT line_order AS line, content FROM dbsc_lines
+            WHERE file_id = $fid ORDER BY line_order;
+        ")
+        printf '{"path":"%s","project":"%s","version":%s,"lines":%s}\n' \
+            "$(json_escape "$path")" "$(json_escape "$PROJECT")" "$ver" "$lines_json"
+    else
+        echo "📄 $path (project: $PROJECT, version $ver)"
+        sqlite3 -batch -noheader -separator '  ' "$DB_FILE" "
+            SELECT line_order, content FROM dbsc_lines
+            WHERE file_id = $fid
+            ORDER BY line_order;
+        "
+    fi
 }
 
 list_versions() {
     local path="$1"
-    echo "📋 Versions for $path (project: $PROJECT):"
-    sqlite3 -batch -header -column "$DB_FILE" "
-        SELECT id, version, active, created_at
-        FROM dbsc_sources
-        WHERE project='$(sql_escape "$PROJECT")' AND path='$(sql_escape "$path")'
-        ORDER BY version DESC;
-    "
+    if [ "$JSON_MODE" -eq 1 ]; then
+        sqlite3 -json -batch "$DB_FILE" "
+            SELECT id, version, active, created_at
+            FROM dbsc_sources
+            WHERE project='$(sql_escape "$PROJECT")' AND path='$(sql_escape "$path")'
+            ORDER BY version DESC;
+        "
+    else
+        echo "📋 Versions for $path (project: $PROJECT):"
+        sqlite3 -batch -header -column "$DB_FILE" "
+            SELECT id, version, active, created_at
+            FROM dbsc_sources
+            WHERE project='$(sql_escape "$PROJECT")' AND path='$(sql_escape "$path")'
+            ORDER BY version DESC;
+        "
+    fi
+}
+
+_grep_file_raw() {
+    local path="$1" pattern="$2"
+    local fid=$(get_file_id "$path")
+    [ -z "$fid" ] && return 0
+    # Unit separator (0x1F) between fields — won't collide with real source content.
+    sqlite3 -batch -noheader "$DB_FILE" "
+        SELECT line_order || char(31) || content FROM dbsc_lines
+        WHERE file_id = $fid ORDER BY line_order;
+    " | while IFS=$'\x1f' read -r lineno content; do
+        if printf '%s' "$content" | grep -qE -- "$pattern"; then
+            if [ "$JSON_MODE" -eq 1 ]; then
+                printf '{"path":"%s","line":%s,"content":"%s"}\n' \
+                    "$(json_escape "$path")" "$lineno" "$(json_escape "$content")"
+            else
+                printf '%s:%s:%s\n' "$path" "$lineno" "$content"
+            fi
+        fi
+    done
+}
+
+grep_file() {
+    local path="$1" pattern="$2"
+    ensure_file_id "$path" >/dev/null
+    if [ "$JSON_MODE" -eq 1 ]; then
+        local matches=$(_grep_file_raw "$path" "$pattern")
+        if [ -z "$matches" ]; then echo "[]"; else echo "[$(printf '%s' "$matches" | paste -sd, -)]"; fi
+    else
+        _grep_file_raw "$path" "$pattern"
+    fi
+}
+
+grep_all() {
+    local pattern="$1"
+    local paths=$(sqlite3 -batch -noheader -list "$DB_FILE" "
+        SELECT path FROM dbsc_sources WHERE project='$(sql_escape "$PROJECT")' AND active=1;
+    ")
+    if [ "$JSON_MODE" -eq 1 ]; then
+        local all=""
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            local m=$(_grep_file_raw "$p" "$pattern")
+            [ -n "$m" ] && all="${all:+$all$'\n'}$m"
+        done <<< "$paths"
+        if [ -z "$all" ]; then echo "[]"; else echo "[$(printf '%s' "$all" | paste -sd, -)]"; fi
+    else
+        while IFS= read -r p; do
+            [ -n "$p" ] && _grep_file_raw "$p" "$pattern"
+        done <<< "$paths"
+    fi
 }
 
 rollback() {
@@ -329,8 +544,13 @@ case $ACTION in
     insert_line) insert_line "$PATH_ARG" "$LINE_NUM" "$CONTENT_ARG" ;;
     delete_line) delete_line "$PATH_ARG" "$LINE_NUM" ;;
     replace_line) replace_line "$PATH_ARG" "$LINE_NUM" "$CONTENT_ARG" ;;
+    replace_range) replace_range "$PATH_ARG" "$START_ARG" "$END_ARG" "$RANGE_FILE_ARG" ;;
+    replace_block) replace_block "$PATH_ARG" "$START_ARG" "$OLD_FILE_ARG" "$RANGE_FILE_ARG" ;;
+    line) line_at "$PATH_ARG" "$LINE_NUM" ;;
     show) show_file "$PATH_ARG" ;;
     list) list_versions "$PATH_ARG" ;;
+    grep) grep_file "$PATH_ARG" "$PATTERN_ARG" ;;
+    grep_all) grep_all "$PATTERN_ARG" ;;
     rollback) rollback "$PATH_ARG" "$VERSION_ARG" ;;
     *) echo "No action specified. Use --help."; exit 1 ;;
 esac
