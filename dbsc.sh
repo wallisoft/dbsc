@@ -8,6 +8,7 @@
 #   --init                       Create tables (also runs automatically on first use)
 #   --deploy <path>               Reconstruct <path> from DB lines to DEPLOY_DIR
 #   --deploy-all                  Reconstruct all active files for current project
+#   --files                       List every tracked file in the current project
 #   --update <file>                Insert/update a file (split into lines, new version)
 #   --insert-line <path> <n> <c>  Insert a line (shifts later lines)
 #   --delete-line <path> <n>      Delete a line (shifts later lines)
@@ -53,6 +54,7 @@ while [[ $# -gt 0 ]]; do
         --init) ACTION="init"; shift ;;
         --deploy) ACTION="deploy"; PATH_ARG="$2"; shift 2 ;;
         --deploy-all) ACTION="deploy_all"; shift ;;
+        --files) ACTION="files"; shift ;;
         --update) ACTION="update"; FILE_ARG="$2"; shift 2 ;;
         --insert-line) ACTION="insert_line"; PATH_ARG="$2"; LINE_NUM="$3"; CONTENT_ARG="$4"; shift 4 ;;
         --delete-line) ACTION="delete_line"; PATH_ARG="$2"; LINE_NUM="$3"; shift 3 ;;
@@ -84,6 +86,7 @@ Usage:
   dbsc.sh --update <file>                        # Insert/update file (new version)
   dbsc.sh --deploy <path>                        # Reconstruct <path> to DEPLOY_DIR
   dbsc.sh --deploy-all                           # Reconstruct all active files
+  dbsc.sh --files                                # List every tracked file in the current project
   dbsc.sh --insert-line <path> <num> <content>   # Insert a line (shift)
   dbsc.sh --delete-line <path> <num>             # Delete a line (shift)
   dbsc.sh --replace-line <path> <num> <content>  # Replace a line
@@ -547,6 +550,32 @@ list_versions() {
     fi
 }
 
+files_in_project() {
+    local pe=$(sql_escape "$PROJECT")
+    if [ "$JSON_MODE" -eq 1 ]; then
+        sqlite3 -json -batch "$DB_FILE" "
+            SELECT s.path AS path, s.version AS version, s.created_at AS updated_at,
+                   COUNT(l.id) AS lines
+            FROM dbsc_sources s
+            JOIN dbsc_lines l ON l.file_id = s.id
+            WHERE s.project='$pe' AND s.active=1
+            GROUP BY s.id
+            ORDER BY s.path;
+        "
+    else
+        echo "📂 Tracked files in project '$PROJECT':"
+        sqlite3 -batch -header -column "$DB_FILE" "
+            SELECT s.path AS path, s.version AS version, s.created_at AS updated_at,
+                   COUNT(l.id) AS lines
+            FROM dbsc_sources s
+            JOIN dbsc_lines l ON l.file_id = s.id
+            WHERE s.project='$pe' AND s.active=1
+            GROUP BY s.id
+            ORDER BY s.path;
+        "
+    fi
+}
+
 _grep_file_raw() {
     local path="$1" pattern="$2"
     local fid=$(get_file_id "$path")
@@ -618,6 +647,7 @@ case $ACTION in
     init) init ;;
     deploy) deploy_file "$PATH_ARG" ;;
     deploy_all) deploy_all ;;
+    files) files_in_project ;;
     update) update_file "$FILE_ARG" ;;
     insert_line) insert_line "$PATH_ARG" "$LINE_NUM" "$CONTENT_ARG" ;;
     delete_line) delete_line "$PATH_ARG" "$LINE_NUM" ;;

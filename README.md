@@ -66,6 +66,9 @@ dbsc.sh --deploy myscript.php --deploy-dir /var/www/html
 dbsc.sh --list myscript.php
 dbsc.sh --rollback myscript.php 2
 
+# What's actually tracked in this project?
+dbsc.sh --files
+
 # Find a line without piping through grep and getting an off-by-one
 # from a header line — output is path:line:content, ready to paste
 # straight into --replace-line
@@ -111,6 +114,7 @@ all.
 | `--update <file>` | Insert/update a file (new version, split into lines) |
 | `--deploy <path>` | Reconstruct `<path>` from the DB to `--deploy-dir` |
 | `--deploy-all` | Reconstruct every active file for the current project |
+| `--files` | List every tracked file in the current project, with version/line count |
 | `--insert-line <path> <n> <content>` | Insert a line, shifting the rest down |
 | `--delete-line <path> <n>` | Delete a line, shifting the rest up |
 | `--replace-line <path> <n> <content>` | Replace a single line in place |
